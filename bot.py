@@ -47,6 +47,8 @@ import asyncio
 import functools
 import logging
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable
 
@@ -94,6 +96,48 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("merged-middleman")
+
+
+# ---------------------------------------------------------------------------
+# Render HTTP health server
+# ---------------------------------------------------------------------------
+# Render Web Services expect the process to listen on the PORT environment
+# variable. Telegram updates still use long-polling; this HTTP server is only
+# for Render health checks and does not replace Telegram polling.
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/health", "/healthz"):
+            body = b"OK"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        body = b"Not Found"
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_render_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="render-health-server",
+        daemon=True,
+    )
+    thread.start()
+    logger.info("Render health server listening on 0.0.0.0:%s", port)
+    return server
 
 
 # ---------------------------------------------------------------------------
@@ -755,6 +799,8 @@ async def start_bot_application(app: Application, name: str) -> None:
     await app.updater.start_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
+        poll_interval=0.5,
+        timeout=30,
     )
 
     logger.info("%s polling started", name)
@@ -827,6 +873,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    health_server = start_render_health_server()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
@@ -834,3 +881,9 @@ if __name__ == "__main__":
     except Exception:
         logger.exception("Fatal startup/runtime error")
         raise
+    finally:
+        try:
+            health_server.shutdown()
+            health_server.server_close()
+        except Exception:
+            pass
